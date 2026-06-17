@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
 # Absolute system interpreter on purpose (see nfc-fido-verify for why).
 """nfc-fido-enroll - enrol a FIDO2 NFC authenticator for nfc-fido-pam.
 

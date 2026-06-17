@@ -92,6 +92,10 @@ store), name every module by absolute path — see
   emptiness.
 - A failed/forged tap returns non-zero, which under `sufficient` simply falls
   through to the next method — it does not hard-deny.
+- **Known limitation:** the verifier checks the challenge signature, relying-party
+  hash, and credential id, but does **not** track the FIDO signature counter, so
+  it won't detect a cloned authenticator. Acceptable for an implant/personal
+  token; add counter persistence if your threat model needs clone detection.
 
 ## License
 

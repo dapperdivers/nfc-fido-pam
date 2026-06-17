@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
 # NOTE: absolute system interpreter on purpose - a PAM helper must not inherit a
 # user's pyenv/venv shim (which won't have python-fido2/pyscard). Debian ships
 # python3 at /usr/bin/python3; adjust at package build time for other distros.

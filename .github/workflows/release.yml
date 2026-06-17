@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+# Scoped to exactly what creating a release needs.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Install toolchain
+        run: |
+          apt-get update
+          apt-get install -y git dpkg-dev fakeroot
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Build package
+        run: ./build.sh
+      - name: Publish release with .deb
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: dist/*.deb
+          generate_release_notes: true
+          body: |
+            ## nfc-fido-pam ${{ github.ref_name }}
+
+            PAM authentication with a FIDO2 NFC authenticator (e.g. an NFC implant)
+            read over PC/SC. The auth layer above a PC/SC reader such as
+            thinkpad-nfc-pcsc.
+
+            **Install:**
+            ```
+            sudo apt install ./nfc-fido-pam_*_all.deb
+            ```
+            Then enrol (`sudo nfc-fido-enroll --user <you>`) and wire into PAM —
+            see /usr/share/doc/nfc-fido-pam/examples/.
