@@ -76,6 +76,7 @@ def main():
         die("must run as root to write %s" % args.store_dir)
 
     try:
+        from fido2.ctap import CtapError
         from fido2.ctap2 import Ctap2
         from fido2 import cbor
     except Exception as e:
@@ -85,22 +86,36 @@ def main():
     if os.path.exists(store) and not args.force:
         die("%s already exists; pass --force to overwrite" % store)
 
-    print("Tap the implant on the reader (waiting up to %gs)..." % args.timeout, flush=True)
-    dev = find_device(args.timeout)
-    if dev is None:
-        die("no authenticator detected - is pcscd running and the reader present?", 2)
-
-    ctap = Ctap2(dev)
     client_data_hash = os.urandom(32)
     rp = {"id": args.rp_id, "name": args.rp_id}
     user = {"id": hashlib.sha256(args.user.encode()).digest(), "name": args.user}
     key_params = [{"type": "public-key", "alg": -7}]  # ES256
-    try:
-        # Non-resident credential (rk off): we store the credential id ourselves.
-        att = ctap.make_credential(client_data_hash, rp, user, key_params,
-                                   options={"rk": False})
-    except Exception as e:
-        die("make_credential failed: %r" % e, 3)
+
+    print("Tap and HOLD the authenticator on the reader (up to %gs)..." % args.timeout, flush=True)
+    deadline = time.time() + args.timeout
+    att = None
+    last_err = None
+    while att is None:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        dev = find_device(min(2.0, remaining))
+        if dev is None:
+            continue
+        try:
+            # Non-resident credential (rk off): we store the credential id ourselves.
+            att = Ctap2(dev).make_credential(client_data_hash, rp, user, key_params,
+                                             options={"rk": False})
+        except CtapError as e:
+            die("registration rejected by authenticator: %r" % e, 3)
+        except Exception as e:
+            # transient coupling/comm drop (token left the field) - retry while time remains
+            last_err = e
+            time.sleep(0.2)
+    if att is None:
+        if last_err is None:
+            die("no authenticator detected - is pcscd running and the reader present?", 2)
+        die("lost contact with the authenticator - hold it still on the reader: %r" % last_err, 2)
 
     # WebAuthn 7.1 registration checks before we trust this credential.
     ad = bytes(att.auth_data)
