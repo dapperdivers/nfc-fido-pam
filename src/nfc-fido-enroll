@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import pwd
+import struct
 import sys
 import time
 
@@ -101,11 +102,27 @@ def main():
     except Exception as e:
         die("make_credential failed: %r" % e, 3)
 
+    # WebAuthn 7.1 registration checks before we trust this credential.
+    ad = bytes(att.auth_data)
+    if ad[:32] != hashlib.sha256(args.rp_id.encode()).digest():
+        die("registration rpIdHash mismatch", 3)
+    flags = ad[32]
+    if not (flags & 0x01):
+        die("user-presence (UP) flag not set during registration", 3)
+    if not (flags & 0x40):
+        die("attested credential data (AT) flag not set", 3)
+    sign_count = struct.unpack(">I", ad[33:37])[0]
+
     cred = att.auth_data.credential_data
+    if cred.public_key.get(3) != -7:  # must match the ES256 we asked for
+        die("authenticator returned an unexpected key algorithm: %r" % cred.public_key.get(3), 3)
+
     rec = {
         "rp_id": args.rp_id,
         "cred_id": base64.b64encode(cred.credential_id).decode(),
         "pubkey": base64.b64encode(cbor.encode(cred.public_key)).decode(),
+        "sign_count": sign_count,         # initial high-water mark for clone detection (Tier 2)
+        "aaguid": cred.aaguid.hex(),      # authenticator model id (for attestation pinning, Tier 3)
     }
 
     os.makedirs(args.store_dir, mode=0o755, exist_ok=True)

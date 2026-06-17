@@ -47,6 +47,27 @@ DEFAULT_STORE_DIR = "/etc/nfc-fido"
 DEFAULT_RP_ID = "nfc-pam"
 DEFAULT_TIMEOUT = 3.0
 
+# COSE algorithms accepted for the enrolled key. Pinning to a known-good set
+# defends a tampered store from substituting a weak/unexpected algorithm:
+# -7 ES256, -35/-36 ES384/512, -8 EdDSA, -37/-38/-39 PS256/384/512, -257 RS256.
+ALLOWED_ALGS = {-7, -35, -36, -8, -37, -38, -39, -257}
+
+
+def store_is_safe(path):
+    """True only if `path` and its parent dir are root-owned and not group/other-writable.
+
+    The enrollment record is public data, but its *integrity* is what authorizes a
+    credential: a writable store would let an attacker enrol their own key.
+    """
+    for p in (path, os.path.dirname(path)):
+        try:
+            st = os.stat(p)
+        except OSError:
+            return False
+        if st.st_uid != 0 or (st.st_mode & 0o022):
+            return False
+    return True
+
 
 def log(args, msg):
     """Diagnostics to stderr; silenced under --quiet (pam_exec passes `quiet`)."""
@@ -110,6 +131,9 @@ def verify(args, user):
     if not os.path.exists(store):
         log(args, "no implant enrolled for %r (looked in %s)" % (user, store))
         return ABSENT
+    if not store_is_safe(store):
+        log(args, "refusing %s: store must be root-owned and not group/other-writable" % store)
+        return ERROR
 
     try:
         from fido2.ctap2 import Ctap2
@@ -128,6 +152,12 @@ def verify(args, user):
         log(args, "enrollment record %s is unreadable: %r" % (store, e))
         return ERROR
 
+    # Pin the key algorithm (the COSE key carries its own alg; reject anything
+    # outside the allow-list in case the store was tampered with).
+    if pub.get(3) not in ALLOWED_ALGS:
+        log(args, "enrolled key uses a disallowed algorithm: %r" % pub.get(3))
+        return ERROR
+
     dev = find_device(args, args.timeout)
     if dev is None:
         log(args, "no implant detected within %gs" % args.timeout)
@@ -142,12 +172,32 @@ def verify(args, user):
         return FAILED
 
     auth_data = bytes(assertion.auth_data)
+    # WebAuthn 7.2 step 16: rpIdHash binds the assertion to our relying-party id.
     if auth_data[:32] != hashlib.sha256(args.rp_id.encode()).digest():
         log(args, "relying-party hash mismatch")
         return FAILED
-    if assertion.credential and assertion.credential.get("id") != cred_id:
-        log(args, "credential id mismatch")
+    flags = auth_data[32]
+    # Step 17: User Present is an unconditional MUST for a (non-silent) assertion.
+    if not (flags & 0x01):
+        log(args, "user-presence (UP) flag not set")
         return FAILED
+    # Step 18 (policy): require User Verification if asked (and supported by the token).
+    if args.require_uv and not (flags & 0x04):
+        log(args, "user-verification (UV) required but flag not set")
+        return FAILED
+    # Step 19: a credential cannot be backed-up (BS) without being backup-eligible (BE).
+    if (flags & 0x10) and not (flags & 0x08):
+        log(args, "invalid backup state: BS set without BE")
+        return FAILED
+    # Steps 1-5: bind to the requested credential. The authenticator MAY omit this
+    # field when the allowList has exactly one entry (CTAP2 6.2) - omission is fine.
+    cred = assertion.credential
+    if cred is not None:
+        cid = cred.get("id") if hasattr(cred, "get") else getattr(cred, "id", None)
+        if cid != cred_id:
+            log(args, "credential id mismatch")
+            return FAILED
+    # Step 23: signature over authData||clientDataHash, using the ENROLLED key/alg.
     try:
         pub.verify(auth_data + challenge, assertion.signature)
     except Exception:
@@ -201,6 +251,9 @@ def main():
                    help="enrollment store directory (default: %(default)s)")
     p.add_argument("--rp-id", default=DEFAULT_RP_ID,
                    help="FIDO relying-party id used at enrollment (default: %(default)s)")
+    p.add_argument("--require-uv", action="store_true",
+                   help="require the User Verified flag (only for tokens with a PIN/biometric; "
+                        "a tap-only implant never sets UV, so leave this off for those)")
     p.add_argument("--success-sound", default=None,
                    help="optional sound file to play in the user's session on success")
     p.add_argument("--quiet", action="store_true", help="suppress diagnostics on stderr")
