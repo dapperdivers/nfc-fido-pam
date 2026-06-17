@@ -103,6 +103,66 @@ def authtok_typed():
     return len(data.split(b"\x00", 1)[0].strip()) > 0
 
 
+def _counter_state_path(args, user):
+    """Where the per-credential signature-counter high-water mark lives.
+
+    Defaults to a per-user path under the account's home (the verifier runs as the
+    user under a lock screen, so this works unprivileged); root context uses
+    /var/lib/nfc-fido. Override with --state-dir to point at a hardened location.
+    """
+    if args.state_dir:
+        base = args.state_dir
+    elif os.geteuid() == 0:
+        base = "/var/lib/nfc-fido"
+    else:
+        try:
+            home = pwd.getpwnam(user).pw_dir          # robust even if $HOME is unset under PAM
+        except KeyError:
+            home = os.path.expanduser("~")
+        base = os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
+        base = os.path.join(base, "nfc-fido")
+    return os.path.join(base, user + ".count")
+
+
+def check_counter(args, user, presented):
+    """WebAuthn 6.1.1 clone detection. Returns 'ok', 'clone', or 'skip'.
+
+    Compares the assertion's signature counter to the stored high-water mark and
+    advances it on a legitimate increase. A non-increasing *nonzero* counter is the
+    spec's cloned-authenticator signal. A constant-0 counter (an authenticator with
+    no counter support) is tolerated per spec - never treated as a clone.
+    """
+    if args.counter_policy == "off":
+        return "ok"
+    path = _counter_state_path(args, user)
+    stored = None
+    try:
+        with open(path) as f:
+            stored = int(f.read().strip())
+    except (OSError, ValueError):
+        stored = None
+    if presented == 0 and (stored is None or stored == 0):
+        _persist_counter(args, path, 0)               # first sight; no clone signal possible
+        return "skip"
+    if stored is None or presented > stored:
+        _persist_counter(args, path, presented)
+        return "ok"
+    return "clone"                                     # presented <= stored: do NOT advance
+
+
+def _persist_counter(args, path, value):
+    """Best-effort atomic write of the high-water mark. A write failure warns but
+    never fails authentication (an unprivileged deployment may not be able to persist)."""
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(value))
+        os.replace(tmp, path)
+    except OSError as e:
+        log(args, "warning: could not persist signature counter to %s: %r" % (path, e))
+
+
 def find_device(args, timeout):
     """Poll briefly for a FIDO authenticator on a PC/SC reader. Returns a device or None."""
     from fido2.pcsc import CtapPcscDevice
@@ -136,6 +196,7 @@ def verify(args, user):
         return ERROR
 
     try:
+        from fido2.ctap import CtapError
         from fido2.ctap2 import Ctap2
         from fido2.cose import CoseKey
         from fido2 import cbor
@@ -165,11 +226,26 @@ def verify(args, user):
 
     challenge = os.urandom(32)
     allow = [{"type": "public-key", "id": cred_id}]
-    try:
-        assertion = Ctap2(dev).get_assertion(args.rp_id, challenge, allow)
-    except Exception as e:
-        log(args, "get_assertion failed: %r" % e)
-        return FAILED
+    # get_assertion can intermittently raise on non-canonical CBOR from some
+    # authenticators (the ECDSA signature length varies between attempts). Retry
+    # transient parse/comm errors while the token is still in the field, but treat
+    # a CtapError (e.g. NO_CREDENTIALS for a non-enrolled token) as a definitive no.
+    assertion = None
+    deadline = time.time() + min(max(args.timeout, 1.0), 6.0)
+    while assertion is None:
+        try:
+            assertion = Ctap2(dev).get_assertion(args.rp_id, challenge, allow)
+        except CtapError as e:
+            log(args, "get_assertion rejected by authenticator: %r" % e)
+            return FAILED
+        except Exception as e:
+            if time.time() >= deadline:
+                log(args, "get_assertion failed after retries: %r" % e)
+                return FAILED
+            time.sleep(0.2)
+            redev = find_device(args, 1.0)
+            if redev is not None:
+                dev = redev
 
     auth_data = bytes(assertion.auth_data)
     # WebAuthn 7.2 step 16: rpIdHash binds the assertion to our relying-party id.
@@ -203,6 +279,15 @@ def verify(args, user):
     except Exception:
         log(args, "signature verification failed")
         return FAILED
+
+    # Step 24 / 6.1.1: signature-counter clone detection (only after the signature
+    # is confirmed authentic, so the counter we trust came from a real assertion).
+    sign_count = int.from_bytes(auth_data[33:37], "big")
+    if check_counter(args, user, sign_count) == "clone":
+        log(args, "signature counter %d did not increase vs stored; possible cloned authenticator"
+            % sign_count)
+        if args.counter_policy == "strict":
+            return FAILED
     return OK
 
 
@@ -254,6 +339,12 @@ def main():
     p.add_argument("--require-uv", action="store_true",
                    help="require the User Verified flag (only for tokens with a PIN/biometric; "
                         "a tap-only implant never sets UV, so leave this off for those)")
+    p.add_argument("--counter-policy", choices=("strict", "warn", "off"), default="strict",
+                   help="action on a non-increasing signature counter (clone signal): "
+                        "strict=reject, warn=allow+log, off=disable (default: strict)")
+    p.add_argument("--state-dir", default=None,
+                   help="directory for the signature-counter high-water mark "
+                        "(default: per-user ~/.local/state/nfc-fido, or /var/lib/nfc-fido as root)")
     p.add_argument("--success-sound", default=None,
                    help="optional sound file to play in the user's session on success")
     p.add_argument("--quiet", action="store_true", help="suppress diagnostics on stderr")

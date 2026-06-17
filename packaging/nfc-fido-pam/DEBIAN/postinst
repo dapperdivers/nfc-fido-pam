@@ -10,6 +10,12 @@ case "$1" in
       mkdir -p /etc/nfc-fido
       chmod 0755 /etc/nfc-fido
     fi
+    # Signature-counter state for the root context (per-user runs default to
+    # ~/.local/state/nfc-fido instead).
+    if [ ! -d /var/lib/nfc-fido ]; then
+      mkdir -p /var/lib/nfc-fido
+      chmod 0700 /var/lib/nfc-fido
+    fi
     cat >&2 <<'EOF'
 nfc-fido-pam installed. Next steps:
   1. Enrol:  sudo nfc-fido-enroll --user <you>      (tap when prompted)

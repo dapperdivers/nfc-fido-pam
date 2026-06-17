@@ -92,10 +92,25 @@ store), name every module by absolute path — see
   emptiness.
 - A failed/forged tap returns non-zero, which under `sufficient` simply falls
   through to the next method — it does not hard-deny.
-- **Known limitation:** the verifier checks the challenge signature, relying-party
-  hash, and credential id, but does **not** track the FIDO signature counter, so
-  it won't detect a cloned authenticator. Acceptable for an implant/personal
-  token; add counter persistence if your threat model needs clone detection.
+
+The verifier follows the WebAuthn §7.2 assertion-verification algorithm (adapted
+for a local, non-browser `clientDataHash`): fresh CSPRNG challenge, `rpIdHash`
+binding, **User-Present flag**, BE/BS backup-state consistency, credential-id
+binding (tolerating the single-allowList omission), algorithm pinning to the
+enrolled COSE key, and the **signature-counter clone check** (§6.1.1).
+
+**Clone detection (`--counter-policy`, `--state-dir`).** Each success advances a
+per-credential high-water mark; an assertion whose counter does not increase is
+the spec's cloned-authenticator signal. Policy is `strict` (reject, default),
+`warn` (allow + log), or `off`. Constant-0 authenticators (no counter support)
+are tolerated per spec, never falsely flagged. The high-water mark defaults to a
+**per-user** path (`~/.local/state/nfc-fido/`, or `/var/lib/nfc-fido` as root):
+this defends against an *external* physical clone (an attacker at the lock screen
+can't write your state), but not against the account owner resetting their own
+counter — point `--state-dir` at a root-owned, privileged-helper-managed location
+for that. If the legitimate token's counter ever resets, clear its state file.
+- **`--require-uv`** enforces User-Verification, for tokens with a PIN/biometric;
+  a tap-only implant never sets UV, so leave it off for those.
 
 ## License
 
