@@ -1,0 +1,29 @@
+# /etc/pam.d/<service> — authenticate with an NFC FIDO2 implant, then fall back.
+#
+# This is the nfc-fido-pam "Layer 3" glue: the stock pam_exec module runs the
+# standalone nfc-fido-verify helper, which does the PC/SC FIDO2 assertion in a
+# clean process and returns 0 on a valid tap. With `sufficient`, a valid tap
+# unlocks; any other result falls through to the next method (here: password).
+#
+# This example targets a NIX-BUILT hyprlock on a non-NixOS host, which is why
+# every module is named by ABSOLUTE PATH: hyprlock's Nix libpam only searches
+# the Nix store, so bare module names (or `@include common-auth`) fail to load.
+# On a normal distro PAM client you can use the short form instead:
+#
+#     auth  sufficient  pam_exec.so quiet /usr/lib/nfc-fido/nfc-fido-verify --pam --timeout 3
+#
+# Note: pam_exec sets $PAM_USER, which `--pam` reads. `quiet` + `--pam` keep it
+# silent. The implant is polled only while PAM runs (on submit), for --timeout
+# seconds, before falling through — so keep the timeout short (2-3s).
+#
+# `expose_authtok` + `--skip-if-authtok`: pam_exec pipes the typed password to the
+# verifier on stdin; if it's non-empty the verifier exits immediately, so TYPING a
+# password never waits on the implant poll. A bare submit (empty field) still polls
+# for a tap. Drop both tokens if you'd rather every submit poll for the implant.
+
+auth  sufficient                 /lib/x86_64-linux-gnu/security/pam_exec.so expose_authtok quiet /usr/lib/nfc-fido/nfc-fido-verify --pam --skip-if-authtok --timeout 3
+auth  [success=1 default=ignore] /lib/x86_64-linux-gnu/security/pam_unix.so nullok try_first_pass
+auth  requisite                  /lib/x86_64-linux-gnu/security/pam_deny.so
+auth  required                   /lib/x86_64-linux-gnu/security/pam_permit.so
+
+account required                 /lib/x86_64-linux-gnu/security/pam_unix.so

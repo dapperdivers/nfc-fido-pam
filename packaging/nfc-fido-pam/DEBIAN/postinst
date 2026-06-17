@@ -1,0 +1,22 @@
+#!/bin/sh
+# nfc-fido-pam postinst: ensure the enrollment store exists. We deliberately do
+# NOT edit any /etc/pam.d file - wiring is the admin's choice (see examples in
+# /usr/share/doc/nfc-fido-pam/examples/).
+set -e
+
+case "$1" in
+  configure)
+    if [ ! -d /etc/nfc-fido ]; then
+      mkdir -p /etc/nfc-fido
+      chmod 0755 /etc/nfc-fido
+    fi
+    cat >&2 <<'EOF'
+nfc-fido-pam installed. Next steps:
+  1. Enrol:  sudo nfc-fido-enroll --user <you>      (tap when prompted)
+  2. Test:   nfc-fido-verify --user <you> --timeout 15   (tap; expect exit 0)
+  3. Wire into PAM - see /usr/share/doc/nfc-fido-pam/examples/
+EOF
+    ;;
+esac
+
+exit 0

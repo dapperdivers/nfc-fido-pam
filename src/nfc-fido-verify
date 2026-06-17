@@ -1,0 +1,233 @@
+#!/usr/bin/python3
+# NOTE: absolute system interpreter on purpose - a PAM helper must not inherit a
+# user's pyenv/venv shim (which won't have python-fido2/pyscard). Debian ships
+# python3 at /usr/bin/python3; adjust at package build time for other distros.
+"""nfc-fido-verify - verify a FIDO2 NFC authenticator over PC/SC (nfc-fido-pam, Layer 2).
+
+Polls a PC/SC reader for a FIDO2 authenticator (e.g. an NFC implant), performs a
+fresh-challenge CTAP2 get_assertion against the credential enrolled for a user,
+and signals the result via its exit code. This is a *standalone* verifier: it does
+the device + crypto work in a normal system process where libfido2/pyscard/libssl
+resolve cleanly, so a PAM client that cannot do PC/SC in-process (e.g. a Nix-built
+lock screen on a non-NixOS host) can still authenticate by simply invoking it.
+
+It is the privilege/environment-separated helper of the nfc-fido-pam stack, in the
+same spirit as pam_unix -> unix_chkpwd or pam_u2f -> pamu2fcfg.
+
+Exit codes:
+  0  verified   implant present and assertion valid           -> PAM auth success
+  1  failed     implant present but assertion/verify failed    -> fall through
+  2  absent     no implant detected, or user not enrolled      -> fall through
+  3  error      internal error (unreadable store, missing libs)-> fall through
+
+Wire it into PAM with the stock pam_exec module, e.g.:
+
+  auth  sufficient  pam_exec.so  quiet  /usr/lib/nfc-fido/nfc-fido-verify --pam --timeout 3
+
+With `sufficient`, any non-zero exit cleanly falls through to the next method
+(fingerprint / password).
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+import time
+
+# Exit codes (also the module's vocabulary).
+OK, FAILED, ABSENT, ERROR = 0, 1, 2, 3
+
+DEFAULT_STORE_DIR = "/etc/nfc-fido"
+DEFAULT_RP_ID = "nfc-pam"
+DEFAULT_TIMEOUT = 3.0
+
+
+def log(args, msg):
+    """Diagnostics to stderr; silenced under --quiet (pam_exec passes `quiet`)."""
+    if not args.quiet:
+        print("nfc-fido-verify: %s" % msg, file=sys.stderr, flush=True)
+
+
+def resolve_user(args):
+    """Pick the target user: explicit --user, else $PAM_USER (set by pam_exec), else current."""
+    if args.user:
+        return args.user
+    if args.pam and os.environ.get("PAM_USER"):
+        return os.environ["PAM_USER"]
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+def authtok_typed():
+    """True if a non-empty password was piped on stdin (pam_exec `expose_authtok`).
+
+    Used with --skip-if-authtok so that *typing a password* skips the implant poll
+    entirely (instant fall-through to pam_unix) while a bare submit still polls for
+    a tap. The token is only tested for emptiness - never logged or used.
+    """
+    import select
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], 1.0)
+        if not ready:
+            return False
+        data = sys.stdin.buffer.read()
+    except Exception:
+        return False
+    # pam_exec writes the authtok terminated by NUL; treat anything non-blank as typed.
+    return len(data.split(b"\x00", 1)[0].strip()) > 0
+
+
+def find_device(args, timeout):
+    """Poll briefly for a FIDO authenticator on a PC/SC reader. Returns a device or None."""
+    from fido2.pcsc import CtapPcscDevice
+    end = time.time() + timeout
+    first = True
+    logged_exc = False
+    while first or time.time() < end:
+        first = False
+        try:
+            devs = list(CtapPcscDevice.list_devices())
+            if devs:
+                return devs[0]
+        except Exception as e:
+            if not logged_exc:
+                logged_exc = True
+                log(args, "PC/SC poll error (retrying): %r" % e)
+        if time.time() >= end:
+            break
+        time.sleep(0.3)
+    return None
+
+
+def verify(args, user):
+    """Returns one of OK / FAILED / ABSENT / ERROR for `user`."""
+    store = os.path.join(args.store_dir, user)
+    if not os.path.exists(store):
+        log(args, "no implant enrolled for %r (looked in %s)" % (user, store))
+        return ABSENT
+
+    try:
+        from fido2.ctap2 import Ctap2
+        from fido2.cose import CoseKey
+        from fido2 import cbor
+    except Exception as e:
+        log(args, "fido2 library unavailable: %r" % e)
+        return ERROR
+
+    try:
+        with open(store) as f:
+            rec = json.load(f)
+        cred_id = base64.b64decode(rec["cred_id"])
+        pub = CoseKey.parse(cbor.decode(base64.b64decode(rec["pubkey"])))
+    except Exception as e:
+        log(args, "enrollment record %s is unreadable: %r" % (store, e))
+        return ERROR
+
+    dev = find_device(args, args.timeout)
+    if dev is None:
+        log(args, "no implant detected within %gs" % args.timeout)
+        return ABSENT
+
+    challenge = os.urandom(32)
+    allow = [{"type": "public-key", "id": cred_id}]
+    try:
+        assertion = Ctap2(dev).get_assertion(args.rp_id, challenge, allow)
+    except Exception as e:
+        log(args, "get_assertion failed: %r" % e)
+        return FAILED
+
+    auth_data = bytes(assertion.auth_data)
+    if auth_data[:32] != hashlib.sha256(args.rp_id.encode()).digest():
+        log(args, "relying-party hash mismatch")
+        return FAILED
+    if assertion.credential and assertion.credential.get("id") != cred_id:
+        log(args, "credential id mismatch")
+        return FAILED
+    try:
+        pub.verify(auth_data + challenge, assertion.signature)
+    except Exception:
+        log(args, "signature verification failed")
+        return FAILED
+    return OK
+
+
+def beep(args, user):
+    """Optional fire-and-forget success chime in the target user's audio session.
+
+    Never blocks or affects the result; silently no-ops if it can't play.
+    """
+    if not args.success_sound:
+        return
+    try:
+        pw = pwd.getpwnam(user)
+    except Exception:
+        return
+    runtime = "/run/user/%d" % pw.pw_uid
+    player = shutil.which("pw-play") or shutil.which("paplay") or shutil.which("aplay")
+    if not player or not os.path.isdir(runtime) or not os.path.exists(args.success_sound):
+        return
+    env = {"XDG_RUNTIME_DIR": runtime, "HOME": pw.pw_dir, "PATH": "/usr/bin:/bin"}
+    kwargs = dict(env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL, close_fds=True)
+    if os.geteuid() == 0 and os.getuid() != pw.pw_uid:
+        def demote():
+            os.setgid(pw.pw_gid)
+            os.setuid(pw.pw_uid)
+        kwargs["preexec_fn"] = demote
+    try:
+        subprocess.Popen([player, args.success_sound], **kwargs)
+    except Exception:
+        pass
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="nfc-fido-verify",
+        description="Verify a FIDO2 NFC authenticator over PC/SC; exit 0 on success.")
+    p.add_argument("--user", help="user to verify (default: $PAM_USER under --pam, else current user)")
+    p.add_argument("--pam", action="store_true",
+                   help="PAM/pam_exec mode: take the user from $PAM_USER and stay quiet")
+    p.add_argument("--skip-if-authtok", action="store_true",
+                   help="if a non-empty password is piped on stdin (pam_exec expose_authtok), "
+                        "skip the implant poll and exit absent immediately (no delay on typed login)")
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                   help="seconds to look for the implant before giving up (default: %(default)s)")
+    p.add_argument("--store-dir", default=DEFAULT_STORE_DIR,
+                   help="enrollment store directory (default: %(default)s)")
+    p.add_argument("--rp-id", default=DEFAULT_RP_ID,
+                   help="FIDO relying-party id used at enrollment (default: %(default)s)")
+    p.add_argument("--success-sound", default=None,
+                   help="optional sound file to play in the user's session on success")
+    p.add_argument("--quiet", action="store_true", help="suppress diagnostics on stderr")
+    args = p.parse_args()
+    if args.pam:
+        args.quiet = True
+
+    try:
+        user = resolve_user(args)
+    except Exception as e:
+        log(args, "could not resolve target user: %r" % e)
+        return ERROR
+
+    if args.skip_if_authtok and authtok_typed():
+        log(args, "password supplied; skipping implant poll")
+        return ABSENT
+
+    try:
+        result = verify(args, user)
+    except Exception as e:
+        log(args, "unexpected error: %r" % e)
+        return ERROR
+
+    if result == OK:
+        beep(args, user)
+        log(args, "verified implant for %s" % user)
+    return result
+
+
+if __name__ == "__main__":
+    sys.exit(main())

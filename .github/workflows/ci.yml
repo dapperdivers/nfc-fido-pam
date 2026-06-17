@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Install toolchain
+        run: |
+          apt-get update
+          apt-get install -y git dpkg-dev python3 python3-fido2 python3-pyscard pyflakes3
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Static checks on the Python executables (syntax + obvious errors).
+      - name: Syntax + lint
+        run: |
+          python3 -m py_compile src/nfc-fido-verify src/nfc-fido-enroll
+          pyflakes3 src/nfc-fido-verify src/nfc-fido-enroll
+
+      # Smoke test: the verifier must import its stack and run its CLI under the
+      # *packaged* python3-fido2 (catches API drift early). No reader -> exit 2.
+      - name: Verifier smoke test
+        run: |
+          python3 src/nfc-fido-verify --help
+          set +e
+          python3 src/nfc-fido-verify --user nobody --timeout 1
+          rc=$?
+          set -e
+          # No enrollment for 'nobody' -> absent (2). Anything but 2 is a regression.
+          test "$rc" = "2" || { echo "unexpected exit $rc"; exit 1; }
+
+      - name: Build package
+        run: ./build.sh
+
+      - name: Inspect the .deb
+        run: |
+          for d in dist/*.deb; do echo "== $d =="; dpkg-deb -I "$d"; dpkg-deb -c "$d"; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/*.deb

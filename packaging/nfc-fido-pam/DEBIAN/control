@@ -1,0 +1,21 @@
+Package: nfc-fido-pam
+Version: @VER@-1
+Architecture: all
+Maintainer: dapperdivers <derek.mackley@hotmail.com>
+Depends: python3 (>= 3.9), python3-fido2 (>= 1.0), python3-pyscard, libpam-modules, pcscd
+Recommends: nfc-nci-pcsc, opensc
+Section: admin
+Priority: optional
+Homepage: https://github.com/dapperdivers/nfc-fido-pam
+Description: PAM authentication with a FIDO2 NFC authenticator over PC/SC
+ Authenticate (login, sudo, screen unlock) by tapping a FIDO2 NFC authenticator -
+ an NFC implant, a contactless security key, or a phone - read over PC/SC.
+ .
+ Ships nfc-fido-verify, a standalone verifier that performs a fresh-challenge
+ CTAP2 get_assertion against an enrolled credential and exits 0 on a valid tap,
+ plus nfc-fido-enroll to register a credential. Wire it into PAM with the stock
+ pam_exec module; the helper-process design means even a PAM client that cannot
+ do PC/SC in-process (e.g. a Nix-built lock screen) can authenticate.
+ .
+ No standard PAM module does FIDO2 over NFC/PC-SC (pam_u2f is USB-HID only), so
+ this verifier fills that gap using the python-fido2 PC/SC backend.

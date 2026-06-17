@@ -1,0 +1,15 @@
+# Generic /etc/pam.d snippet for a normal-distro PAM client (sudo, login, su,
+# a non-Nix lock screen). Add the implant as a `sufficient` method ahead of your
+# existing auth, so a valid tap authenticates and anything else falls through.
+#
+# Short module names work here because the client links the system libpam, which
+# searches /lib/.../security automatically. (A Nix-built client cannot - see
+# hyprlock.example for the absolute-path form.)
+#
+# expose_authtok + --skip-if-authtok: a typed password skips the implant poll
+# (no delay on typed login); a bare submit still polls for a tap.
+
+auth  sufficient  pam_exec.so  expose_authtok quiet  /usr/lib/nfc-fido/nfc-fido-verify --pam --skip-if-authtok --timeout 3
+
+# Then your existing stack, e.g. on Debian:
+# @include common-auth
